@@ -14,6 +14,7 @@
  */
 
 import { useEffect, useState, useRef, useCallback } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { avatarApi, dealershipApi, chatApi } from '../services/api';
 import { 
@@ -24,7 +25,7 @@ import {
 } from '@heygen/liveavatar-web-sdk';
 import { 
   Mic, MicOff, PhoneOff, Phone, Volume2, VolumeX, Loader2, 
-  User, Building2
+  User, Building2, StopCircle
 } from 'lucide-react';
 import clsx from 'clsx';
 import toast from 'react-hot-toast';
@@ -83,6 +84,7 @@ type ConversationMessage = { role: 'user' | 'assistant'; content: string };
 
 export default function VoiceCall() {
   const { user } = useAuth();
+  const [searchParams] = useSearchParams();
   
   // Call state
   const [callState, setCallState] = useState<CallState>('idle');
@@ -98,7 +100,10 @@ export default function VoiceCall() {
   // Conversation state
   const [chatSessionId, setChatSessionId] = useState<string | undefined>();
   const conversationHistoryRef = useRef<ConversationMessage[]>([]);
-  const [mode, setMode] = useState<'training' | 'roleplay'>('training');
+  
+  // Get initial mode from URL query parameter or default to 'training'
+  const initialMode = searchParams.get('mode') === 'roleplay' ? 'roleplay' : 'training';
+  const [mode, setMode] = useState<'training' | 'roleplay'>(initialMode);
   
   // Dealership (for super admin)
   const [dealerships, setDealerships] = useState<Dealership[]>([]);
@@ -122,6 +127,27 @@ export default function VoiceCall() {
   const lastProcessedTranscriptRef = useRef<string>(''); // Prevent duplicate processing
   const pendingResponseRef = useRef<string | null>(null); // Track pending avatar response
   const speakEndTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null); // Debounce speak end
+  const currentRequestIdRef = useRef<number>(0); // Track current request to ignore stale responses
+  const accumulatedTranscriptRef = useRef<string>(''); // Accumulate user speech across multiple final transcripts
+  const processTranscriptTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null); // Debounce processing
+  
+  // Voice Activity Detection (VAD) refs for interrupt detection
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const vadIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const consecutiveSpeechFramesRef = useRef<number>(0);
+  const consecutiveSilenceFramesRef = useRef<number>(0); // Track silence after speech
+  const lastInterimTranscriptRef = useRef<string>(''); // Track last interim for silence processing
+  const silenceProcessTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isInterruptingRef = useRef<boolean>(false); // Prevent double interrupts
+  const lastInterruptTimeRef = useRef<number>(0); // Cooldown for interrupts
+  const isRestartingRecognitionRef = useRef<boolean>(false); // Prevent concurrent restarts
+  const VAD_THRESHOLD = 0.015; // RMS threshold for voice detection
+  const VAD_FRAMES_TO_INTERRUPT = 5; // ~250ms of speech to trigger interrupt
+  const VAD_SILENCE_FRAMES_TO_PROCESS = 30; // ~1.5 seconds of silence to process interim transcript
+  const MIN_WORDS_TO_PROCESS = 2; // Minimum words needed to process interim transcript
+  const INTERRUPT_COOLDOWN_MS = 1000; // Minimum time between interrupts
   
   // Keep dealership ref in sync with state
   useEffect(() => {
@@ -145,9 +171,15 @@ export default function VoiceCall() {
     // Don't process if empty or no session
     if (!trimmedTranscript || !sessionRef.current) return;
     
-    // Don't process if already processing
+    // Prevent processing during an active interrupt
+    if (isInterruptingRef.current) {
+      console.log('Skipping - interrupt in progress');
+      return;
+    }
+    
+    // Prevent concurrent processing (race condition guard)
     if (isProcessingRef.current) {
-      console.log('Skipping - already processing');
+      console.log('Skipping - already processing a request');
       return;
     }
     
@@ -166,18 +198,17 @@ export default function VoiceCall() {
       return;
     }
     
+    // Generate a unique request ID for this request
+    const requestId = ++currentRequestIdRef.current;
+    console.log(`[Request ${requestId}] Starting processing for: "${trimmedTranscript}"`);
+    
     // Set processing flag and remember this transcript
     isProcessingRef.current = true;
     lastProcessedTranscriptRef.current = trimmedTranscript;
     
-    // Stop recognition while processing to prevent picking up stray audio
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch (e) {
-        // Ignore - may already be stopped
-      }
-    }
+    // NOTE: We no longer stop recognition during processing
+    // This allows the user to interrupt Adam at any time
+    // The recognition will continue running and detect interrupts
     
     console.log('Processing user speech:', trimmedTranscript);
     setIsProcessing(true);
@@ -196,7 +227,13 @@ export default function VoiceCall() {
         dealership_id: dealershipId ?? undefined,
       });
       
-      console.log('Backend response:', response);
+      // Check if this request is still current (not interrupted)
+      if (requestId !== currentRequestIdRef.current) {
+        console.log(`[Request ${requestId}] Ignoring stale response - current request is ${currentRequestIdRef.current}`);
+        return;
+      }
+      
+      console.log(`[Request ${requestId}] Backend response:`, response);
       
       // Update session ID
       if (response.session_id) {
@@ -206,9 +243,15 @@ export default function VoiceCall() {
       // Add assistant response to history
       conversationHistoryRef.current.push({ role: 'assistant', content: response.response });
       
+      // Check again if still current before making avatar speak
+      if (requestId !== currentRequestIdRef.current) {
+        console.log(`[Request ${requestId}] Ignoring - interrupted before avatar speak`);
+        return;
+      }
+      
       // FULL mode: Use repeat() to make avatar speak text (built-in TTS)
       if (sessionRef.current && response.response) {
-        console.log('Making avatar speak with repeat():', response.response);
+        console.log(`[Request ${requestId}] Making avatar speak with repeat():`, response.response);
         
         // Track the full response - we'll use this to know when avatar is truly done
         // HeyGen may fire multiple SPEAK_STARTED/ENDED events for long text
@@ -227,12 +270,17 @@ export default function VoiceCall() {
       }
       
     } catch (error) {
-      console.error('Error processing speech:', error);
-      toast.error('Failed to process your message');
-      isAvatarSpeakingRef.current = false;
-      isProcessingRef.current = false;
-      setSpeakingState('none');
-      setIsProcessing(false);
+      // Only handle error if this is still the current request
+      if (requestId === currentRequestIdRef.current) {
+        console.error(`[Request ${requestId}] Error processing speech:`, error);
+        toast.error('Failed to process your message');
+        isAvatarSpeakingRef.current = false;
+        isProcessingRef.current = false;
+        setSpeakingState('none');
+        setIsProcessing(false);
+      } else {
+        console.log(`[Request ${requestId}] Ignoring error - request was interrupted`);
+      }
     }
   }, [chatSessionId, isSuperAdmin, user?.dealership_id, mode]);
 
@@ -284,62 +332,184 @@ export default function VoiceCall() {
         }
       }
       
+      // Check if this speech might be Adam's voice being picked up by the mic
+      // If Adam is speaking and the recognized text matches part of what Adam is saying, ignore it
+      const pendingResponse = pendingResponseRef.current?.toLowerCase() || '';
+      const recognizedText = (interimTranscript || finalTranscript).toLowerCase().trim();
+      
+      // Check if the recognized text is part of Adam's response (echo detection)
+      const isEcho = pendingResponse && recognizedText && (
+        pendingResponse.includes(recognizedText) || 
+        recognizedText.split(' ').some(word => word.length > 3 && pendingResponse.includes(word))
+      );
+      
+      // Debug logging
+      console.log('🎤 Speech recognition result:', {
+        interim: interimTranscript,
+        final: finalTranscript,
+        isAvatarSpeaking: isAvatarSpeakingRef.current,
+        isProcessing: isProcessingRef.current,
+        currentRequestId: currentRequestIdRef.current,
+        isEcho: isEcho
+      });
+      
+      // If this is likely Adam's voice being picked up, ignore it
+      if (isEcho && isAvatarSpeakingRef.current) {
+        console.log('🔇 Ignoring echo - this is Adam\'s voice being picked up');
+        return;
+      }
+      
       // Show interim transcript - user is speaking
       if (interimTranscript) {
         setUserTranscript(interimTranscript);
         setSpeakingState('user');
+        
+        // Track last interim transcript for silence-based processing
+        lastInterimTranscriptRef.current = interimTranscript.trim();
+        consecutiveSilenceFramesRef.current = 0; // Reset silence counter when speaking
+        
+        // INTERRUPT: If Adam is speaking OR processing, and user starts talking, interrupt!
+        // But only if this is NOT an echo of Adam's voice
+        if ((isAvatarSpeakingRef.current || isProcessingRef.current) && sessionRef.current && !isEcho) {
+          console.log('🛑 User interrupting Adam - stopping avatar speech and canceling pending requests');
+          
+          // Increment request ID to invalidate any pending responses
+          currentRequestIdRef.current++;
+          console.log(`New request ID after interrupt: ${currentRequestIdRef.current}`);
+          
+          // Cancel any pending speak-end timeout
+          if (speakEndTimeoutRef.current) {
+            clearTimeout(speakEndTimeoutRef.current);
+            speakEndTimeoutRef.current = null;
+          }
+          
+          // Cancel any pending transcript processing
+          if (processTranscriptTimeoutRef.current) {
+            clearTimeout(processTranscriptTimeoutRef.current);
+            processTranscriptTimeoutRef.current = null;
+          }
+          
+          // Clear accumulated transcript to start fresh
+          accumulatedTranscriptRef.current = '';
+          
+          // Stop the avatar from speaking
+          try {
+            sessionRef.current.interrupt();
+          } catch (e) {
+            console.error('Error interrupting avatar:', e);
+          }
+          
+          // Reset state - allow new transcript to be processed
+          isAvatarSpeakingRef.current = false;
+          isProcessingRef.current = false;
+          pendingResponseRef.current = null;
+          lastProcessedTranscriptRef.current = ''; // Clear to allow new question
+          setIsProcessing(false);
+          
+          // Don't change speakingState - keep it as 'user' since user is speaking
+        }
       }
       
       // Process final transcript only - ignore if it matches last processed
       if (finalTranscript) {
         const trimmed = finalTranscript.trim();
         
-        // Skip if empty or duplicate
-        if (!trimmed || trimmed === lastProcessedTranscriptRef.current) {
-          console.log('Skipping empty or duplicate final transcript');
+        console.log('📝 Final transcript received:', {
+          trimmed,
+          lastProcessed: lastProcessedTranscriptRef.current,
+          isProcessing: isProcessingRef.current,
+          isAvatarSpeaking: isAvatarSpeakingRef.current,
+          isEcho: isEcho,
+          accumulated: accumulatedTranscriptRef.current
+        });
+        
+        // Skip if this is an echo of Adam's voice
+        if (isEcho) {
+          console.log('🔇 Skipping echo final transcript');
           return;
         }
         
-        // Skip if already processing
-        if (isProcessingRef.current) {
-          console.log('Skipping - already processing');
+        // Skip if empty
+        if (!trimmed) {
+          console.log('⏭️ Skipping empty final transcript');
           return;
         }
         
-        console.log('Final transcript:', trimmed);
-        setUserTranscript(trimmed);
-        setSpeakingState('none');
-        processUserSpeech(trimmed);
+        // Accumulate the transcript (user might be speaking in multiple chunks)
+        accumulatedTranscriptRef.current = (accumulatedTranscriptRef.current + ' ' + trimmed).trim();
+        setUserTranscript(accumulatedTranscriptRef.current);
+        
+        // Clear interim transcript since we got a final result
+        lastInterimTranscriptRef.current = '';
+        
+        console.log('📦 Accumulated transcript:', accumulatedTranscriptRef.current);
+        
+        // Cancel any pending processing timeout
+        if (processTranscriptTimeoutRef.current) {
+          clearTimeout(processTranscriptTimeoutRef.current);
+        }
+        
+        // Wait for user to stop speaking before processing (debounce)
+        processTranscriptTimeoutRef.current = setTimeout(() => {
+          const fullTranscript = accumulatedTranscriptRef.current.trim();
+          const wordCount = fullTranscript.split(/\s+/).filter(w => w.length > 0).length;
+          
+          // Skip if duplicate of last processed
+          if (fullTranscript === lastProcessedTranscriptRef.current) {
+            console.log('⏭️ Skipping duplicate accumulated transcript');
+            accumulatedTranscriptRef.current = '';
+            return;
+          }
+          
+          // Skip if too few words (likely a fragment)
+          if (wordCount < MIN_WORDS_TO_PROCESS) {
+            console.log(`⏭️ Skipping short transcript (${wordCount} words): "${fullTranscript}"`);
+            accumulatedTranscriptRef.current = '';
+            return;
+          }
+          
+          if (fullTranscript) {
+            console.log(`✅ Processing accumulated transcript (${wordCount} words):`, fullTranscript);
+            setSpeakingState('none');
+            processUserSpeech(fullTranscript);
+          }
+          
+          // Clear accumulated transcript
+          accumulatedTranscriptRef.current = '';
+        }, 1000); // Wait 1 second after last speech to process
       }
     };
     
     recognition.onend = () => {
       console.log('Speech recognition ended');
-      // Only restart if NOT processing and NOT avatar speaking
-      // If avatar is speaking or we're processing, the SPEAK_ENDED handler will restart us
-      if (isListeningRef.current && !isProcessingRef.current && !isAvatarSpeakingRef.current && !pendingResponseRef.current) {
+      // ALWAYS restart speech recognition if we're supposed to be listening
+      // This allows user to interrupt Adam at any time
+      // But don't restart if we're already restarting (from interrupt handler)
+      if (isListeningRef.current && !isRestartingRecognitionRef.current) {
+        isRestartingRecognitionRef.current = true;
         setTimeout(() => {
-          if (isListeningRef.current && !isProcessingRef.current && !isAvatarSpeakingRef.current && !pendingResponseRef.current && recognitionRef.current) {
+          if (isListeningRef.current && recognitionRef.current) {
             try {
               recognitionRef.current.start();
-              console.log('Speech recognition restarted (from onend)');
-            } catch (e) {
-              console.log('Could not restart recognition:', e);
+              console.log('Speech recognition restarted (from onend) - listening for interrupts');
+            } catch (e: unknown) {
+              if (e instanceof Error && e.name === 'InvalidStateError') {
+                console.log('Speech recognition already running (from onend)');
+              } else {
+                console.log('Could not restart recognition:', e);
+              }
             }
           }
+          isRestartingRecognitionRef.current = false;
         }, 100);
-      } else {
-        console.log('Not restarting recognition - processing:', isProcessingRef.current, 'avatarSpeaking:', isAvatarSpeakingRef.current, 'pendingResponse:', !!pendingResponseRef.current);
       }
     };
     
     // Fired when speech is first detected
     recognition.onspeechstart = () => {
       console.log('Speech detected');
-      // Show that user is speaking (only if not processing)
-      if (!isProcessingRef.current && !isAvatarSpeakingRef.current) {
-        setSpeakingState('user');
-      }
+      // Show that user is speaking - this will trigger interrupt if Adam is speaking
+      setSpeakingState('user');
     };
     
     recognition.onspeechend = () => {
@@ -385,6 +555,236 @@ export default function VoiceCall() {
     }
   }, []);
 
+  // Perform interrupt - stop Adam and prepare for new input
+  const performInterrupt = useCallback(() => {
+    if (!sessionRef.current) return;
+    
+    // Prevent double interrupts with cooldown
+    const now = Date.now();
+    if (isInterruptingRef.current || (now - lastInterruptTimeRef.current) < INTERRUPT_COOLDOWN_MS) {
+      console.log('⏳ Interrupt skipped - cooldown active or already interrupting');
+      return;
+    }
+    
+    isInterruptingRef.current = true;
+    lastInterruptTimeRef.current = now;
+    
+    console.log('🛑 VAD: Performing interrupt - user is speaking');
+    
+    // Increment request ID to invalidate any pending responses
+    currentRequestIdRef.current++;
+    console.log(`New request ID after interrupt: ${currentRequestIdRef.current}`);
+    
+    // Cancel any pending speak-end timeout
+    if (speakEndTimeoutRef.current) {
+      clearTimeout(speakEndTimeoutRef.current);
+      speakEndTimeoutRef.current = null;
+    }
+    
+    // Cancel any pending transcript processing
+    if (processTranscriptTimeoutRef.current) {
+      clearTimeout(processTranscriptTimeoutRef.current);
+      processTranscriptTimeoutRef.current = null;
+    }
+    
+    // Clear accumulated transcript to start fresh
+    accumulatedTranscriptRef.current = '';
+    
+    // Stop the avatar from speaking
+    try {
+      sessionRef.current.interrupt();
+    } catch (e) {
+      console.error('Error interrupting avatar:', e);
+    }
+    
+    // Reset state - allow new transcript to be processed
+    isAvatarSpeakingRef.current = false;
+    isProcessingRef.current = false;
+    pendingResponseRef.current = null;
+    lastProcessedTranscriptRef.current = ''; // Clear to allow new question
+    lastInterimTranscriptRef.current = ''; // Clear interim transcript
+    setIsProcessing(false);
+    setSpeakingState('user');
+    
+    // Reset VAD counters
+    consecutiveSpeechFramesRef.current = 0;
+    consecutiveSilenceFramesRef.current = 0;
+    
+    // Restart speech recognition to get a clean slate for the new question
+    // This helps avoid partial transcripts from the interrupted speech
+    if (recognitionRef.current && isListeningRef.current && !isRestartingRecognitionRef.current) {
+      isRestartingRecognitionRef.current = true;
+      try {
+        recognitionRef.current.stop();
+        // Small delay before restarting
+        setTimeout(() => {
+          if (recognitionRef.current && isListeningRef.current) {
+            try {
+              recognitionRef.current.start();
+              console.log('🔄 Speech recognition restarted after interrupt');
+            } catch (e: unknown) {
+              if (e instanceof Error && e.name === 'InvalidStateError') {
+                console.log('Speech recognition already running after interrupt');
+              } else {
+                console.log('Could not restart recognition:', e);
+              }
+            }
+          }
+          isRestartingRecognitionRef.current = false;
+          isInterruptingRef.current = false; // Clear interrupt flag after restart completes
+        }, 150);
+      } catch (e) {
+        console.log('Could not stop recognition for restart:', e);
+        isRestartingRecognitionRef.current = false;
+        isInterruptingRef.current = false;
+      }
+    } else {
+      // Clear interrupt flag if we didn't restart recognition
+      setTimeout(() => {
+        isInterruptingRef.current = false;
+      }, 200);
+    }
+  }, []);
+
+  // Start Voice Activity Detection for interrupt
+  const startVAD = useCallback(async () => {
+    try {
+      // Get microphone stream
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: { 
+          echoCancellation: true, 
+          noiseSuppression: true,
+          autoGainControl: true 
+        } 
+      });
+      micStreamRef.current = stream;
+      
+      // Create audio context and analyser
+      const audioContext = new AudioContext();
+      audioContextRef.current = audioContext;
+      
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 512;
+      analyserRef.current = analyser;
+      
+      const source = audioContext.createMediaStreamSource(stream);
+      source.connect(analyser);
+      
+      // Start VAD interval - check for voice activity every 50ms
+      vadIntervalRef.current = setInterval(() => {
+        if (!analyserRef.current) return;
+        
+        const dataArray = new Float32Array(analyserRef.current.fftSize);
+        analyserRef.current.getFloatTimeDomainData(dataArray);
+        
+        // Calculate RMS (Root Mean Square) for volume level
+        let sum = 0;
+        for (let i = 0; i < dataArray.length; i++) {
+          sum += dataArray[i] * dataArray[i];
+        }
+        const rms = Math.sqrt(sum / dataArray.length);
+        
+        // Check if voice is detected
+        const isVoiceDetected = rms > VAD_THRESHOLD;
+        
+        // Only check for interrupt if Adam is ACTUALLY SPEAKING (audio playing)
+        // Don't interrupt during processing/waiting for response - let the user's speech be captured
+        if (isAvatarSpeakingRef.current) {
+          if (isVoiceDetected) {
+            consecutiveSpeechFramesRef.current++;
+            consecutiveSilenceFramesRef.current = 0; // Reset silence counter
+            console.log(`🎤 VAD: Voice detected (${consecutiveSpeechFramesRef.current}/${VAD_FRAMES_TO_INTERRUPT}) RMS: ${rms.toFixed(4)}`);
+            
+            if (consecutiveSpeechFramesRef.current >= VAD_FRAMES_TO_INTERRUPT) {
+              performInterrupt();
+            }
+          } else {
+            // Reset counter if silence detected
+            if (consecutiveSpeechFramesRef.current > 0) {
+              consecutiveSpeechFramesRef.current = 0;
+            }
+          }
+        } else {
+          // Adam is not speaking - check for silence to process interim transcript
+          if (isVoiceDetected) {
+            consecutiveSpeechFramesRef.current++;
+            consecutiveSilenceFramesRef.current = 0;
+          } else {
+            consecutiveSpeechFramesRef.current = 0;
+            consecutiveSilenceFramesRef.current++;
+            
+            // If we have an interim transcript and enough silence, process it
+            if (consecutiveSilenceFramesRef.current >= VAD_SILENCE_FRAMES_TO_PROCESS) {
+              const interimText = lastInterimTranscriptRef.current;
+              const wordCount = interimText.trim().split(/\s+/).filter(w => w.length > 0).length;
+              
+              if (interimText && !isProcessingRef.current) {
+                // Only process if we have enough words (avoid processing fragments like "between")
+                if (wordCount >= MIN_WORDS_TO_PROCESS) {
+                  console.log(`🔇 VAD: Silence detected - processing interim transcript (${wordCount} words): "${interimText}"`);
+                  
+                  // Clear the interim transcript
+                  lastInterimTranscriptRef.current = '';
+                  consecutiveSilenceFramesRef.current = 0;
+                  
+                  // Add to accumulated transcript and process
+                  if (interimText !== lastProcessedTranscriptRef.current) {
+                    accumulatedTranscriptRef.current = (accumulatedTranscriptRef.current + ' ' + interimText).trim();
+                    
+                    // Cancel any pending processing timeout
+                    if (processTranscriptTimeoutRef.current) {
+                      clearTimeout(processTranscriptTimeoutRef.current);
+                    }
+                    
+                    // Process immediately since we detected silence
+                    const fullTranscript = accumulatedTranscriptRef.current.trim();
+                    if (fullTranscript) {
+                      console.log('✅ VAD: Processing transcript after silence:', fullTranscript);
+                      setSpeakingState('none');
+                      processUserSpeech(fullTranscript);
+                      accumulatedTranscriptRef.current = '';
+                    }
+                  }
+                } else {
+                  // Too few words - wait longer for more speech
+                  // Only log once per silence period
+                  if (consecutiveSilenceFramesRef.current === VAD_SILENCE_FRAMES_TO_PROCESS) {
+                    console.log(`⏳ VAD: Waiting for more speech (only ${wordCount} words: "${interimText}")`);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }, 50); // Check every 50ms
+      
+      console.log('VAD started for interrupt detection');
+    } catch (error) {
+      console.error('Failed to start VAD:', error);
+    }
+  }, [performInterrupt, processUserSpeech]);
+
+  // Stop Voice Activity Detection
+  const stopVAD = useCallback(() => {
+    if (vadIntervalRef.current) {
+      clearInterval(vadIntervalRef.current);
+      vadIntervalRef.current = null;
+    }
+    if (audioContextRef.current) {
+      audioContextRef.current.close();
+      audioContextRef.current = null;
+    }
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach(track => track.stop());
+      micStreamRef.current = null;
+    }
+    analyserRef.current = null;
+    consecutiveSpeechFramesRef.current = 0;
+    consecutiveSilenceFramesRef.current = 0;
+    lastInterimTranscriptRef.current = '';
+    console.log('VAD stopped');
+  }, []);
+
   // Start the call
   const startCall = useCallback(async () => {
     if (sessionRef.current) return;
@@ -423,6 +823,8 @@ export default function VoiceCall() {
           setCallState('connected');
           // Start listening for speech when connected
           startListening();
+          // Start VAD for interrupt detection during avatar speech
+          startVAD();
         } else if (state === SessionState.DISCONNECTED) {
           setCallState('idle');
           stopListening();
@@ -443,6 +845,12 @@ export default function VoiceCall() {
       // IMPORTANT: HeyGen fires multiple SPEAK_STARTED/ENDED events for long text
       // We debounce SPEAK_ENDED to avoid restarting mic between chunks
       session.on(AgentEventsEnum.AVATAR_SPEAK_STARTED, () => {
+        // Ignore if we're in the middle of an interrupt
+        if (isInterruptingRef.current) {
+          console.log('Avatar started speaking (ignored - interrupt in progress)');
+          return;
+        }
+        
         console.log('Avatar started speaking');
         isAvatarSpeakingRef.current = true;
         setSpeakingState('avatar');
@@ -452,6 +860,22 @@ export default function VoiceCall() {
           clearTimeout(speakEndTimeoutRef.current);
           speakEndTimeoutRef.current = null;
           console.log('Cancelled speak-end timeout - avatar still speaking');
+        }
+        
+        // IMPORTANT: Make sure speech recognition is running so user can interrupt!
+        // But don't try if we're already restarting
+        if (recognitionRef.current && isListeningRef.current && !isRestartingRecognitionRef.current) {
+          try {
+            recognitionRef.current.start();
+            console.log('Speech recognition started/restarted - listening for interrupts');
+          } catch (e: unknown) {
+            // InvalidStateError means recognition is already running - that's fine
+            if (e instanceof Error && e.name === 'InvalidStateError') {
+              console.log('Speech recognition already running - ready for interrupts');
+            } else {
+              console.log('Could not start recognition:', e);
+            }
+          }
         }
       });
       
@@ -485,8 +909,13 @@ export default function VoiceCall() {
               try {
                 recognitionRef.current.start();
                 console.log('Speech recognition started after avatar finished');
-              } catch (e) {
-                console.log('Could not start recognition:', e);
+              } catch (e: unknown) {
+                // InvalidStateError means recognition is already running - that's fine
+                if (e instanceof Error && e.name === 'InvalidStateError') {
+                  console.log('Speech recognition already running - ready for input');
+                } else {
+                  console.log('Could not start recognition:', e);
+                }
               }
             }
           }, 500); // Additional 500ms after debounce
@@ -524,6 +953,9 @@ export default function VoiceCall() {
     // Stop speech recognition
     stopListening();
     
+    // Stop VAD
+    stopVAD();
+    
     // Clear any pending speak-end timeout
     if (speakEndTimeoutRef.current) {
       clearTimeout(speakEndTimeoutRef.current);
@@ -559,7 +991,7 @@ export default function VoiceCall() {
     // Reset conversation for next call
     setChatSessionId(undefined);
     conversationHistoryRef.current = [];
-  }, [stopListening, chatSessionId]);
+  }, [stopListening, stopVAD, chatSessionId]);
 
   // Handle dealership change - end current call and reset conversation
   const handleDealershipChange = useCallback((newDealershipId: number) => {
@@ -589,6 +1021,58 @@ export default function VoiceCall() {
     }
   }, [isMicMuted, startListening, stopListening]);
 
+  // Manual interrupt - stop Adam and let user speak
+  const manualInterrupt = useCallback(() => {
+    console.log('🛑 Manual interrupt triggered');
+    
+    if (!sessionRef.current) return;
+    
+    // Increment request ID to invalidate any pending responses
+    currentRequestIdRef.current++;
+    console.log(`New request ID after manual interrupt: ${currentRequestIdRef.current}`);
+    
+    // Cancel any pending speak-end timeout
+    if (speakEndTimeoutRef.current) {
+      clearTimeout(speakEndTimeoutRef.current);
+      speakEndTimeoutRef.current = null;
+    }
+    
+    // Cancel any pending transcript processing
+    if (processTranscriptTimeoutRef.current) {
+      clearTimeout(processTranscriptTimeoutRef.current);
+      processTranscriptTimeoutRef.current = null;
+    }
+    
+    // Clear accumulated transcript
+    accumulatedTranscriptRef.current = '';
+    
+    // Stop the avatar from speaking
+    try {
+      sessionRef.current.interrupt();
+      toast.success('Adam stopped - speak now!');
+    } catch (e) {
+      console.error('Error interrupting avatar:', e);
+    }
+    
+    // Reset state
+    isAvatarSpeakingRef.current = false;
+    isProcessingRef.current = false;
+    pendingResponseRef.current = null;
+    lastProcessedTranscriptRef.current = '';
+    setIsProcessing(false);
+    setSpeakingState('none');
+    setUserTranscript('');
+    
+    // Make sure speech recognition is running
+    if (recognitionRef.current && isListeningRef.current) {
+      try {
+        recognitionRef.current.start();
+      } catch (e) {
+        // Already running, that's fine
+      }
+    }
+  }, []);
+
   // Toggle audio (speaker)
   const toggleAudio = useCallback(() => {
     if (videoRef.current) {
@@ -597,6 +1081,20 @@ export default function VoiceCall() {
     }
   }, []);
 
+  // Keyboard shortcut for interrupt (Escape key)
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Escape key to interrupt Adam
+      if (e.key === 'Escape' && (speakingState === 'avatar' || isProcessing)) {
+        e.preventDefault();
+        manualInterrupt();
+      }
+    };
+    
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [speakingState, isProcessing, manualInterrupt]);
+
   // Cleanup on unmount only
   useEffect(() => {
     return () => {
@@ -604,6 +1102,20 @@ export default function VoiceCall() {
       if (recognitionRef.current && isListeningRef.current) {
         recognitionRef.current.stop();
         isListeningRef.current = false;
+      }
+      
+      // Stop VAD
+      if (vadIntervalRef.current) {
+        clearInterval(vadIntervalRef.current);
+        vadIntervalRef.current = null;
+      }
+      if (audioContextRef.current) {
+        audioContextRef.current.close();
+        audioContextRef.current = null;
+      }
+      if (micStreamRef.current) {
+        micStreamRef.current.getTracks().forEach(track => track.stop());
+        micStreamRef.current = null;
       }
       
       // Stop HeyGen session
@@ -817,43 +1329,51 @@ export default function VoiceCall() {
         )}
       </div>
       
-      {/* Captions - show only user transcript */}
+      {/* Captions - show user transcript or interrupt hint */}
       <div className="h-16 flex items-center justify-center px-4">
-        {userTranscript && (
+        {userTranscript ? (
           <div className="max-w-2xl w-full">
             <p className="text-gray-800 text-lg text-center">
               <span className="text-blue-600 font-medium">You: </span>
               {userTranscript}
             </p>
           </div>
-        )}
+        ) : (speakingState === 'avatar' || isProcessing) ? (
+          <div className="max-w-2xl w-full">
+            <p className="text-orange-600 text-sm text-center animate-pulse">
+              💡 Press <kbd className="px-1 py-0.5 bg-orange-100 rounded text-xs font-mono">Esc</kbd> or click the orange button to interrupt Adam
+            </p>
+          </div>
+        ) : null}
       </div>
       
       {/* Bottom controls */}
       <div className="h-24 bg-white border-t border-gray-200 flex items-center justify-center gap-4 px-4">
-        {/* Mic toggle - shows red when not listening (avatar speaking or processing) */}
+        {/* Interrupt button - only shows when Adam is speaking */}
+        {(speakingState === 'avatar' || isProcessing) && callState === 'connected' && (
+          <button
+            onClick={manualInterrupt}
+            className="w-14 h-14 rounded-full flex items-center justify-center transition-all shadow-md bg-orange-500 hover:bg-orange-600 text-white animate-pulse"
+            title="Stop Adam and speak"
+          >
+            <StopCircle className="w-6 h-6" />
+          </button>
+        )}
+        
+        {/* Mic toggle */}
         <button
           onClick={toggleMic}
-          disabled={callState !== 'connected' || speakingState === 'avatar' || isProcessing}
+          disabled={callState !== 'connected'}
           className={clsx(
             'w-14 h-14 rounded-full flex items-center justify-center transition-all shadow-md',
-            // Red when muted OR when avatar is speaking/processing (not listening)
-            (isMicMuted || speakingState === 'avatar' || isProcessing)
+            isMicMuted
               ? 'bg-red-500 text-white' 
               : 'bg-gray-100 hover:bg-gray-200 text-gray-700',
-            (callState !== 'connected' || speakingState === 'avatar' || isProcessing) && 'cursor-not-allowed'
+            callState !== 'connected' && 'cursor-not-allowed'
           )}
-          title={
-            speakingState === 'avatar' 
-              ? 'Wait for Adam to finish speaking' 
-              : isProcessing 
-                ? 'Processing your message...'
-                : isMicMuted 
-                  ? 'Unmute microphone' 
-                  : 'Mute microphone'
-          }
+          title={isMicMuted ? 'Unmute microphone' : 'Mute microphone'}
         >
-          {(isMicMuted || speakingState === 'avatar' || isProcessing) ? (
+          {isMicMuted ? (
             <MicOff className="w-6 h-6" />
           ) : (
             <Mic className="w-6 h-6" />

@@ -5,34 +5,37 @@ import { Database, Mic, BookOpen, Users } from 'lucide-react';
 export default function Dashboard() {
   const { user } = useAuth();
 
+  const isAdmin = user?.role === 'super_admin' || user?.role === 'dealership_admin';
+  
   const features = [
-    {
+    // RAG Management - only for admins
+    ...(isAdmin ? [{
       title: 'RAG Management',
       description: 'Upload documents and manage your knowledge base',
       icon: Database,
       link: '/rag',
       color: 'bg-blue-500',
-    },
-    {
-      title: 'Voice Chat',
-      description: 'Have voice conversations with the AI trainer',
-      icon: Mic,
-      link: '/voice-chat',
-      color: 'bg-green-500',
-    },
+    }] : []),
     {
       title: 'Training Mode',
       description: 'Learn from Adam Marburger\'s expertise',
       icon: BookOpen,
-      link: '/voice-chat',
+      link: '/voice-call?mode=training',
       color: 'bg-purple-500',
     },
     {
       title: 'Role-Play',
       description: 'Practice with AI customers',
       icon: Users,
-      link: '/voice-chat',
+      link: '/voice-call?mode=roleplay',
       color: 'bg-orange-500',
+    },
+    {
+      title: 'Text Chat',
+      description: 'Chat with the AI trainer via text',
+      icon: Mic,
+      link: '/chat',
+      color: 'bg-green-500',
     },
   ];
 

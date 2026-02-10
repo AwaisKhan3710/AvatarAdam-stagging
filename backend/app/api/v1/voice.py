@@ -92,8 +92,8 @@ _voice_sessions: dict[str, VoiceChatSession] = {}
 @router.post("/chat", response_model=VoiceChatResponse, status_code=status.HTTP_200_OK)
 @limiter.limit(VOICE_LIMIT)
 async def voice_chat(
-    http_request: Request,
-    request: VoiceChatRequest,
+    request: Request,
+    voice_request: VoiceChatRequest,
     db: Annotated[AsyncSession, Depends(get_db_session)],
     current_user: Annotated[User, Depends(get_current_active_user)],
 ) -> VoiceChatResponse:
@@ -118,9 +118,9 @@ async def voice_chat(
     # Determine dealership ID based on user role
     if current_user.role == UserRole.SUPER_ADMIN:
         # Super admin must provide dealership_id
-        if not request.dealership_id:
+        if not voice_request.dealership_id:
             raise ValidationError("Super admin must specify dealership_id")
-        dealership_id = request.dealership_id
+        dealership_id = voice_request.dealership_id
     else:
         # Regular users use their assigned dealership
         if not current_user.dealership_id:
@@ -130,7 +130,7 @@ async def voice_chat(
         dealership_id = current_user.dealership_id
 
         # If dealership_id is provided, ensure it matches user's dealership
-        if request.dealership_id and request.dealership_id != dealership_id:
+        if voice_request.dealership_id and voice_request.dealership_id != dealership_id:
             raise AuthorizationError(
                 "You can only use voice chat for your own dealership"
             )
@@ -143,14 +143,14 @@ async def voice_chat(
         raise NotFoundError("Dealership not found")
 
     # Training mode requires RAG
-    if request.mode == "training" and not dealership.rag_config:
+    if voice_request.mode == "training" and not dealership.rag_config:
         raise ValidationError(
             "RAG not initialized for your dealership. Please contact your dealership admin."
         )
 
     # Get or create session
     session_id = (
-        request.session_id or f"voice_{current_user.id}_{datetime.utcnow().timestamp()}"
+        voice_request.session_id or f"voice_{current_user.id}_{datetime.utcnow().timestamp()}"
     )
 
     if session_id not in _voice_sessions:
@@ -215,14 +215,14 @@ async def voice_chat(
 
     # Decode audio
     try:
-        audio_data = base64.b64decode(request.audio_base64)
+        audio_data = base64.b64decode(voice_request.audio_base64)
     except Exception:
         raise ValidationError("Invalid base64 audio data")
 
     # Process audio
     result = await session.process_audio(
         audio_data=audio_data,
-        mode=request.mode,
+        mode=voice_request.mode,
     )
 
     return VoiceChatResponse(
@@ -244,8 +244,8 @@ _fast_sessions: dict[str, dict] = {}
 )
 @limiter.limit(VOICE_LIMIT)
 async def voice_chat_fast(
-    http_request: Request,
-    request: VoiceChatRequest,
+    request: Request,
+    voice_request: VoiceChatRequest,
     db: Annotated[AsyncSession, Depends(get_db_session)],
     current_user: Annotated[User, Depends(get_current_active_user)],
 ) -> VoiceChatResponse:
@@ -271,16 +271,16 @@ async def voice_chat_fast(
     """
     # Determine dealership ID based on user role
     if current_user.role == UserRole.SUPER_ADMIN:
-        if not request.dealership_id:
+        if not voice_request.dealership_id:
             raise ValidationError("Super admin must specify dealership_id")
-        dealership_id = request.dealership_id
+        dealership_id = voice_request.dealership_id
     else:
         if not current_user.dealership_id:
             raise ValidationError(
                 "User must be associated with a dealership to use voice chat"
             )
         dealership_id = current_user.dealership_id
-        if request.dealership_id and request.dealership_id != dealership_id:
+        if voice_request.dealership_id and voice_request.dealership_id != dealership_id:
             raise AuthorizationError(
                 "You can only use voice chat for your own dealership"
             )
@@ -294,7 +294,7 @@ async def voice_chat_fast(
 
     # Get or create fast session
     session_id = (
-        request.session_id or f"fast_{current_user.id}_{datetime.utcnow().timestamp()}"
+        voice_request.session_id or f"fast_{current_user.id}_{datetime.utcnow().timestamp()}"
     )
 
     if session_id not in _fast_sessions:
@@ -304,7 +304,7 @@ async def voice_chat_fast(
 
     # Decode audio
     try:
-        audio_data = base64.b64decode(request.audio_base64)
+        audio_data = base64.b64decode(voice_request.audio_base64)
     except Exception:
         raise ValidationError("Invalid base64 audio data")
 
@@ -312,9 +312,10 @@ async def voice_chat_fast(
     realtime_service = get_realtime_voice_service()
     result = await realtime_service.process_voice_fast(
         audio_data=audio_data,
-        mode=request.mode,
+        mode=voice_request.mode,
         context="",  # No RAG context for speed
         conversation_history=session["history"],
+        mime_type=voice_request.mime_type,
     )
 
     # Update session history
@@ -665,6 +666,7 @@ async def voice_chat_live_websocket(
     audio_buffer: list[bytes] = []
     is_recording = False
     is_processing = False
+    is_interrupted = False  # Flag to cancel current processing when user interrupts
     websocket_active = True
 
     async def send_json_safe(payload: dict):
@@ -681,15 +683,21 @@ async def voice_chat_live_websocket(
 
     async def process_audio(audio_data: bytes):
         """Process the audio and generate response."""
-        nonlocal is_processing
+        nonlocal is_processing, is_interrupted
 
         if is_processing or not audio_data:
             return
 
         is_processing = True
+        is_interrupted = False  # Reset interrupt flag for new processing
 
         try:
             await send_json_safe({"type": "processing"})
+
+            # Check for interrupt before transcription
+            if is_interrupted:
+                logger.info("[VOICE WS] Processing interrupted before transcription")
+                return
 
             # Transcribe audio using Whisper
             stt_result = await realtime_service.transcribe_audio_fast(audio_data)
@@ -704,6 +712,11 @@ async def voice_chat_live_websocket(
                 )
                 return
 
+            # Check for interrupt after transcription
+            if is_interrupted:
+                logger.info("[VOICE WS] Processing interrupted after transcription")
+                return
+
             await send_json_safe(
                 {
                     "type": "transcript",
@@ -716,18 +729,32 @@ async def voice_chat_live_websocket(
             if not transcript:
                 return
 
-            # Generate and stream response
+            # Generate and stream response (check for interrupt during generation)
             full_response = ""
             async for chunk in realtime_service.generate_response_stream(
                 query=transcript,
                 mode=mode,
                 conversation_history=conversation_history,
             ):
+                if is_interrupted:
+                    logger.info("[VOICE WS] Processing interrupted during LLM generation")
+                    return
                 full_response += chunk
+
+            # Check for interrupt before TTS
+            if is_interrupted:
+                logger.info("[VOICE WS] Processing interrupted before TTS")
+                return
 
             # Generate TTS for the response
             if full_response:
                 audio = await realtime_service.text_to_speech(full_response)
+                
+                # Final interrupt check before sending audio
+                if is_interrupted:
+                    logger.info("[VOICE WS] Processing interrupted before sending audio")
+                    return
+                    
                 await send_json_safe(
                     {
                         "type": "audio",
@@ -745,10 +772,12 @@ async def voice_chat_live_websocket(
                     conversation_history[:] = conversation_history[-8:]
 
         except Exception as e:
-            await send_json_safe({"type": "error", "message": str(e)})
+            if not is_interrupted:  # Don't send error if we were just interrupted
+                await send_json_safe({"type": "error", "message": str(e)})
         finally:
             is_processing = False
-            await send_json_safe({"type": "ready"})
+            if not is_interrupted:
+                await send_json_safe({"type": "ready"})
 
     try:
         # Wait for init message
@@ -777,6 +806,7 @@ async def voice_chat_live_websocket(
                         if msg_type == "start_recording":
                             audio_buffer = []
                             is_recording = True
+                            is_interrupted = False  # Reset interrupt flag for new recording
                             await send_json_safe({"type": "speaking_started"})
 
                         elif msg_type == "stop_recording":
@@ -799,9 +829,17 @@ async def voice_chat_live_websocket(
                             if audio_data:
                                 asyncio.create_task(process_audio(audio_data))
 
+                        elif msg_type == "interrupt":
+                            # User is interrupting Adam's response
+                            logger.info("[VOICE WS] User interrupt received - canceling current processing")
+                            is_interrupted = True
+                            audio_buffer = []  # Clear any buffered audio
+                            await send_json_safe({"type": "interrupted"})
+
                         elif msg_type == "clear":
                             conversation_history.clear()
                             audio_buffer = []
+                            is_interrupted = True  # Also interrupt any ongoing processing
                             await send_json_safe({"type": "cleared"})
 
                         elif msg_type == "ping":

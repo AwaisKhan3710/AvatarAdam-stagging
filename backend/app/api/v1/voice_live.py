@@ -28,6 +28,7 @@ class LiveVoiceSession:
     - Audio buffering and STT via OpenAI Whisper
     - Response generation and TTS via ElevenLabs
     - Conversation history
+    - User interruption support for natural conversation flow
     """
     
     def __init__(self, websocket: WebSocket, user_id: int):
@@ -37,10 +38,14 @@ class LiveVoiceSession:
         self.conversation_history: list[dict] = []
         self.is_processing = False
         self.is_active = True
+        self.is_interrupted = False  # Flag to cancel current processing when user interrupts
         self.realtime_service = get_realtime_voice_service()
         self._process_lock = asyncio.Lock()
         self._audio_buffer: list[bytes] = []
         self._is_recording = False
+        self._silence_counter = 0
+        self._silence_threshold = 5  # Number of silent frames before processing
+        self._last_audio_time = 0
     
     async def send_json(self, payload: dict) -> bool:
         """Send JSON to client. Returns False if connection is closed."""
@@ -57,6 +62,7 @@ class LiveVoiceSession:
         """Start buffering audio."""
         self._audio_buffer = []
         self._is_recording = True
+        self.is_interrupted = False  # Reset interrupt flag for new recording
     
     def add_audio_chunk(self, audio_data: bytes):
         """Add audio chunk to buffer."""
@@ -72,10 +78,17 @@ class LiveVoiceSession:
             return audio
         return b""
     
+    def interrupt(self):
+        """Interrupt current processing - called when user starts speaking during response."""
+        logger.info(f"[LiveVoice] User {self.user_id} interrupted response")
+        self.is_interrupted = True
+        self._audio_buffer = []  # Clear any buffered audio
+    
     async def process_audio(self, audio_data: bytes, use_streaming: bool = True) -> None:
         """
         Process audio data and generate response with streaming TTS.
         Uses a lock to prevent duplicate processing.
+        Supports interruption - if user starts speaking during response, processing stops.
         
         Args:
             use_streaming: If True, streams audio chunks as they're generated.
@@ -87,9 +100,15 @@ class LiveVoiceSession:
                 return
             
             self.is_processing = True
+            self.is_interrupted = False  # Reset interrupt flag for new processing
             
         try:
             await self.send_json({"type": "processing"})
+            
+            # Check for interrupt before starting
+            if self.is_interrupted:
+                logger.info("[LiveVoice] Processing interrupted before start")
+                return
             
             # Use the streaming pipeline
             full_response = ""
@@ -101,6 +120,11 @@ class LiveVoiceSession:
                 conversation_history=self.conversation_history,
                 use_websocket_tts=use_streaming,
             ):
+                # Check for interrupt during processing
+                if self.is_interrupted:
+                    logger.info("[LiveVoice] Processing interrupted during streaming")
+                    return
+                    
                 if chunk["type"] == "transcript":
                     user_transcript = chunk["text"]
                     await self.send_json({
@@ -111,6 +135,10 @@ class LiveVoiceSession:
                     })
                 
                 elif chunk["type"] == "audio_chunk":
+                    # Check for interrupt before sending audio
+                    if self.is_interrupted:
+                        logger.info("[LiveVoice] Processing interrupted before audio chunk")
+                        return
                     # Streaming audio chunk - send immediately for playback
                     await self.send_json({
                         "type": "audio_chunk",
@@ -118,6 +146,10 @@ class LiveVoiceSession:
                     })
                 
                 elif chunk["type"] == "audio":
+                    # Check for interrupt before sending audio
+                    if self.is_interrupted:
+                        logger.info("[LiveVoice] Processing interrupted before audio")
+                        return
                     # Complete audio (fallback mode)
                     await self.send_json({
                         "type": "audio",
@@ -126,11 +158,12 @@ class LiveVoiceSession:
                 
                 elif chunk["type"] == "done":
                     full_response = chunk["text"]
-                    await self.send_json({
-                        "type": "response_complete",
-                        "text": full_response,
-                        "user_text": user_transcript,
-                    })
+                    if not self.is_interrupted:
+                        await self.send_json({
+                            "type": "response_complete",
+                            "text": full_response,
+                            "user_text": user_transcript,
+                        })
                 
                 elif chunk["type"] == "error":
                     await self.send_json({
@@ -139,8 +172,8 @@ class LiveVoiceSession:
                     })
                     return
             
-            # Update conversation history
-            if full_response and user_transcript:
+            # Update conversation history (only if not interrupted)
+            if full_response and user_transcript and not self.is_interrupted:
                 self.conversation_history.append({"role": "user", "content": user_transcript})
                 self.conversation_history.append({"role": "assistant", "content": full_response})
                 
@@ -149,11 +182,13 @@ class LiveVoiceSession:
                     self.conversation_history = self.conversation_history[-10:]
                     
         except Exception as e:
-            logger.error(f"[LiveVoice] Error processing audio: {e}")
-            await self.send_json({"type": "error", "message": str(e)})
+            if not self.is_interrupted:  # Don't send error if we were just interrupted
+                logger.error(f"[LiveVoice] Error processing audio: {e}")
+                await self.send_json({"type": "error", "message": str(e)})
         finally:
             self.is_processing = False
-            await self.send_json({"type": "ready"})
+            if not self.is_interrupted:
+                await self.send_json({"type": "ready"})
 
 
 @router.websocket("/ws/live/{user_id}")
@@ -214,19 +249,29 @@ async def voice_chat_live(websocket: WebSocket, user_id: int):
                         msg_type = data.get("type")
                         
                         if msg_type == "start_recording":
+                            logger.info(f"[LiveVoice] User {user_id} started recording")
                             session.start_recording()
                             await session.send_json({"type": "speaking_started"})
                         
                         elif msg_type == "stop_recording":
+                            logger.info(f"[LiveVoice] User {user_id} stopped recording")
                             audio_data = session.stop_recording()
                             await session.send_json({"type": "speaking_stopped"})
                             if audio_data:
+                                logger.info(f"[LiveVoice] Processing {len(audio_data)} bytes of audio")
                                 asyncio.create_task(session.process_audio(audio_data))
+                            else:
+                                logger.warning(f"[LiveVoice] No audio data to process")
                         
                         elif msg_type == "audio":
                             # Base64 encoded audio chunk
-                            audio_chunk = base64.b64decode(data.get("data", ""))
-                            session.add_audio_chunk(audio_chunk)
+                            try:
+                                audio_chunk = base64.b64decode(data.get("data", ""))
+                                if audio_chunk and session._is_recording:
+                                    session.add_audio_chunk(audio_chunk)
+                                    logger.debug(f"[LiveVoice] Added {len(audio_chunk)} bytes to buffer")
+                            except Exception as e:
+                                logger.error(f"[LiveVoice] Error decoding audio: {e}")
                         
                         elif msg_type == "audio_complete":
                             # Complete audio in one message (alternative to streaming)
@@ -234,8 +279,15 @@ async def voice_chat_live(websocket: WebSocket, user_id: int):
                             if audio_data:
                                 asyncio.create_task(session.process_audio(audio_data))
                         
+                        elif msg_type == "interrupt":
+                            # User is interrupting Adam's response
+                            logger.info(f"[LiveVoice] User {user_id} interrupt received - canceling current processing")
+                            session.interrupt()
+                            await session.send_json({"type": "interrupted"})
+                        
                         elif msg_type == "clear":
                             session.conversation_history.clear()
+                            session.interrupt()  # Also interrupt any ongoing processing
                             await session.send_json({"type": "cleared"})
                         
                         elif msg_type == "ping":

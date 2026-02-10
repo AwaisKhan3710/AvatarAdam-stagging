@@ -235,6 +235,46 @@ export function useVoiceChat() {
     setVoiceState(stateRefs.current.isListening ? 'listening' : 'idle');
   }, []);
 
+  // Interrupt Adam's response - stop audio/avatar and signal backend
+  const interruptResponse = useCallback(() => {
+    console.log('🛑 Interrupting Adam response');
+    
+    // Stop audio playback immediately
+    if (currentAudioRef.current) {
+      currentAudioRef.current.pause();
+      currentAudioRef.current = null;
+    }
+    audioQueueRef.current = [];
+    isPlayingRef.current = false;
+    
+    // Stop avatar speaking if enabled
+    if (avatarEnabledRef.current && avatarSessionRef.current) {
+      try {
+        avatarSessionRef.current.interrupt();
+      } catch (e) {
+        console.error('Error interrupting avatar:', e);
+      }
+    }
+    
+    // Signal backend to cancel current processing
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'interrupt' }));
+    }
+    
+    // Clear pending message
+    if (pendingMessageIdRef.current) {
+      setChatMessages(prev => prev.map(msg => 
+        msg.id === pendingMessageIdRef.current 
+          ? { ...msg, isStreaming: false, content: msg.content || '[Interrupted]' }
+          : msg
+      ));
+      pendingMessageIdRef.current = null;
+    }
+    
+    // Set state to listening so we can capture the new question
+    setVoiceState('listening');
+  }, []);
+
   // WebSocket
   const handleWsMessage = useCallback((event: MessageEvent) => {
     try {
@@ -308,6 +348,11 @@ export function useVoiceChat() {
             pendingMessageIdRef.current = null;
           }
           setVoiceState(stateRefs.current.isListening ? 'listening' : 'idle');
+          break;
+        case 'interrupted':
+          // Server acknowledged the interrupt
+          console.log('✅ Server acknowledged interrupt');
+          setVoiceState('listening');
           break;
         case 'cleared':
           setTranscript('');
@@ -399,14 +444,89 @@ export function useVoiceChat() {
       const processor = audioContext.createScriptProcessor(4096, 1, 1);
       processorRef.current = processor;
 
+      // VAD state tracking
+      let isRecording = false;
+      let silenceFrames = 0;
+      const SILENCE_THRESHOLD = 0.02;
+      const SILENCE_FRAMES_NEEDED = 10; // ~200ms of silence
+
       processor.onaudioprocess = (e) => {
-        if (wsRef.current?.readyState === WebSocket.OPEN && stateRefs.current.voiceState !== 'speaking') {
-          const inputData = e.inputBuffer.getChannelData(0);
-          const int16Data = new Int16Array(inputData.length);
-          for (let i = 0; i < inputData.length; i++) {
-            int16Data[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
+        if (wsRef.current?.readyState !== WebSocket.OPEN) {
+          return;
+        }
+
+        const inputData = e.inputBuffer.getChannelData(0);
+        
+        // Calculate RMS to detect speech
+        let sum = 0;
+        for (let i = 0; i < inputData.length; i++) {
+          sum += inputData[i] * inputData[i];
+        }
+        const rms = Math.sqrt(sum / inputData.length);
+        const isSilent = rms < SILENCE_THRESHOLD;
+        
+        // Check if Adam is currently responding (audio playing, avatar speaking, or processing)
+        const currentState = stateRefs.current.voiceState;
+        const isAdamResponding = currentState === 'speaking' || currentState === 'processing';
+        const isAudioPlaying = currentAudioRef.current !== null && !currentAudioRef.current.paused;
+        const hasQueuedAudio = audioQueueRef.current.length > 0 || isPlayingRef.current;
+        
+        // If Adam is responding and user starts talking, interrupt immediately!
+        if ((isAdamResponding || isAudioPlaying || hasQueuedAudio) && !isSilent) {
+          console.log('🛑 User speaking while Adam responding - INTERRUPTING!', {
+            state: currentState,
+            isAudioPlaying,
+            hasQueuedAudio,
+            rms: rms.toFixed(4)
+          });
+          
+          // Stop everything immediately
+          interruptResponse();
+          
+          // Don't return - continue to process this audio as new speech!
+        }
+
+        // Convert to Int16
+        const int16Data = new Int16Array(inputData.length);
+        for (let i = 0; i < inputData.length; i++) {
+          int16Data[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
+        }
+
+        // Send as base64 encoded JSON message (same protocol as VoiceChat.tsx)
+        const base64Audio = btoa(String.fromCharCode.apply(null, Array.from(new Uint8Array(int16Data.buffer))));
+
+        if (!isSilent) {
+          // Audio detected
+          if (!isRecording) {
+            // Start recording
+            isRecording = true;
+            silenceFrames = 0;
+            console.log('🎤 Speech detected - starting recording');
+            wsRef.current.send(JSON.stringify({ type: 'start_recording' }));
+          } else {
+            // Continue recording - reset silence counter
+            silenceFrames = 0;
           }
-          wsRef.current.send(int16Data.buffer);
+
+          // Send audio chunk
+          wsRef.current.send(JSON.stringify({
+            type: 'audio',
+            data: base64Audio,
+            sample_rate: 16000
+          }));
+        } else {
+          // Silence detected
+          if (isRecording) {
+            silenceFrames++;
+
+            if (silenceFrames >= SILENCE_FRAMES_NEEDED) {
+              // Stop recording after sustained silence
+              isRecording = false;
+              silenceFrames = 0;
+              console.log('⏹️ Silence detected - stopping recording');
+              wsRef.current.send(JSON.stringify({ type: 'stop_recording' }));
+            }
+          }
         }
       };
 
@@ -420,7 +540,7 @@ export function useVoiceChat() {
       console.error('Failed to start listening:', error);
       toast.error('Failed to access microphone');
     }
-  }, [isConnected, connectWebSocket]);
+  }, [isConnected, connectWebSocket, interruptResponse]);
 
   const stopListening = useCallback(() => {
     stopAudioStream();

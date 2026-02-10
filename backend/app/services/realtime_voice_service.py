@@ -5,6 +5,8 @@ import base64
 import io
 import json
 import logging
+import struct
+import wave
 from typing import AsyncGenerator
 
 import httpx
@@ -12,6 +14,7 @@ import websockets
 from openai import AsyncOpenAI
 
 from app.core.config import settings
+from app.services.mock_stt_service import get_mock_stt_service
 
 logger = logging.getLogger(__name__)
 
@@ -42,27 +45,92 @@ class RealtimeVoiceService:
         # ElevenLabs WebSocket URL for streaming TTS
         self.elevenlabs_ws_url = f"wss://api.elevenlabs.io/v1/text-to-speech/{self.elevenlabs_voice_id}/stream-input?model_id={self.elevenlabs_model}&output_format=mp3_44100_128"
 
-    async def transcribe_audio_fast(self, audio_data: bytes) -> dict:
-        """Fast STT using OpenAI Whisper. Auto-detects audio format."""
+    async def transcribe_audio_fast(self, audio_data: bytes, mime_type: str = "audio/webm") -> dict:
+        """Fast STT using OpenAI Whisper or Mock STT. Handles various audio formats."""
+        # Check if using mock STT for testing
+        if settings.USE_MOCK_STT:
+            logger.info("Using mock STT service (no API costs)")
+            mock_service = get_mock_stt_service(
+                use_random=settings.MOCK_STT_RANDOM,
+                mode="training"
+            )
+            return await mock_service.transcribe_async(audio_data)
+        
         try:
-            # Create a file-like object for the API
-            audio_file = io.BytesIO(audio_data)
-            audio_file.name = "audio.webm"  # Default to webm, Whisper auto-detects
+            # Check if audio is too short
+            if len(audio_data) < 100:
+                logger.warning(f"Audio too short: {len(audio_data)} bytes")
+                return {"transcript": "", "confidence": 0.0, "error": "Audio too short"}
+            
+            # Detect audio format from magic bytes or use provided mime_type
+            file_ext = "webm"  # Default to webm (browser recording format)
+            
+            # Check magic bytes to detect format
+            if audio_data[:4] == b'RIFF':
+                file_ext = "wav"
+            elif audio_data[:4] == b'\x1aE\xdf\xa3':  # WebM/Matroska magic bytes
+                file_ext = "webm"
+            elif audio_data[:3] == b'ID3' or audio_data[:2] == b'\xff\xfb':
+                file_ext = "mp3"
+            elif audio_data[:4] == b'OggS':
+                file_ext = "ogg"
+            elif audio_data[:4] == b'fLaC':
+                file_ext = "flac"
+            else:
+                # Use mime_type to determine extension
+                ext_map = {
+                    "audio/wav": "wav",
+                    "audio/webm": "webm",
+                    "audio/mp3": "mp3",
+                    "audio/mpeg": "mp3",
+                    "audio/ogg": "ogg",
+                    "audio/flac": "flac",
+                    "audio/m4a": "m4a",
+                    "audio/mp4": "m4a",
+                }
+                file_ext = ext_map.get(mime_type, "webm")
+            
+            # Create a file-like object with the correct extension
+            audio_buffer = io.BytesIO(audio_data)
+            audio_buffer.name = f"audio.{file_ext}"
 
+            logger.info(f"Transcribing {len(audio_data)} bytes of {file_ext} audio")
+            
             response = await self.openai_client.audio.transcriptions.create(
                 model="whisper-1",
-                file=audio_file,
+                file=audio_buffer,
                 language="en",
                 response_format="verbose_json",
             )
 
+            logger.info(f"Transcription result: '{response.text}'")
+            
             return {
                 "transcript": response.text,
                 "confidence": 1.0,  # Whisper doesn't provide confidence scores
             }
         except Exception as e:
-            logger.error(f"STT Error: {e}")
-            return {"transcript": "", "confidence": 0.0, "error": str(e)}
+            error_str = str(e)
+            logger.error(f"STT Error: {error_str}")
+            
+            # Check for specific error types
+            if "insufficient_quota" in error_str or "429" in error_str:
+                logger.error("OpenAI API quota exceeded. Please check your billing and API key.")
+                logger.error("💡 Tip: Set USE_MOCK_STT=true in .env to test without API costs")
+                return {
+                    "transcript": "",
+                    "confidence": 0.0,
+                    "error": "OpenAI API quota exceeded. Please check your billing and API key. Set USE_MOCK_STT=true to test without costs."
+                }
+            elif "getaddrinfo failed" in error_str or "ConnectError" in error_str:
+                logger.error("Network connectivity issue. Cannot reach OpenAI API.")
+                return {
+                    "transcript": "",
+                    "confidence": 0.0,
+                    "error": "Network connectivity issue. Cannot reach OpenAI API."
+                }
+            
+            return {"transcript": "", "confidence": 0.0, "error": error_str}
 
     async def generate_response_stream(
         self,
@@ -321,14 +389,29 @@ Give short, natural responses. One concern or question at a time. Never break ch
         mode: str = "training",
         context: str = "",
         conversation_history: list[dict] | None = None,
+        mime_type: str = "audio/webm",
     ) -> dict:
         """Non-streaming version for simple endpoint."""
-        stt_result = await self.transcribe_audio_fast(audio_data)
+        stt_result = await self.transcribe_audio_fast(audio_data, mime_type=mime_type)
         transcript = stt_result["transcript"]
         confidence = stt_result.get("confidence", 0.0)
+        error = stt_result.get("error")
 
         if not transcript:
-            fallback = "I didn't catch that."
+            # Check if there's a specific error
+            if error:
+                if "quota" in error.lower() or "429" in error:
+                    fallback = "API quota exceeded. Please check your OpenAI billing."
+                elif "network" in error.lower() or "connect" in error.lower():
+                    fallback = "Network error. Please check your internet connection."
+                elif "too short" in error.lower():
+                    fallback = "Audio was too short. Please speak longer."
+                else:
+                    fallback = f"Error: {error}"
+            else:
+                fallback = "I didn't catch that. Please speak again."
+            
+            logger.warning(f"STT failed with error: {error}")
             return {
                 "transcript": "",
                 "response": fallback,

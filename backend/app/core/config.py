@@ -77,6 +77,10 @@ class Settings(BaseSettings):
     HEYGEN_API_URL: str = "https://api.liveavatar.com"
     HEYGEN_SANDBOX_MODE: bool = True  # Set to False for production
 
+    # Testing & Development
+    USE_MOCK_STT: bool = False  # Set to True to use mock STT service (no API costs)
+    MOCK_STT_RANDOM: bool = True  # If True, returns random test phrases
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
