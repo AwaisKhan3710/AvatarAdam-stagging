@@ -431,12 +431,21 @@ export default function VoiceChat() {
     if (!user?.id || wsRef.current?.readyState === WebSocket.OPEN) return;
     if (wsRef.current?.readyState === WebSocket.CONNECTING) return;
 
+    // Get authentication token
+    const token = localStorage.getItem('access_token');
+    if (!token) {
+      toast.error('Authentication required. Please log in again.');
+      return;
+    }
+
     setVoiceState('connecting');
-    const ws = new WebSocket(`${getWsBaseUrl()}/voice/ws/live/${user.id}`);
+    const wsUrl = `${getWsBaseUrl()}/voice/ws/live/${user.id}?token=${encodeURIComponent(token)}`;
+    const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
     ws.onopen = () => {
       console.log('✅ WebSocket connected');
+      setIsConnected(true);
       ws.send(JSON.stringify({ type: 'init', mode: stateRefs.current.mode }));
     };
 
@@ -455,9 +464,14 @@ export default function VoiceChat() {
 
     ws.onerror = (error) => {
       console.error('❌ WebSocket error:', error);
-      toast.error('Connection error');
+      // Try to get more details about the error
+      const errorMsg = error instanceof Event 
+        ? 'Connection error - please check your session'
+        : 'Connection failed';
+      toast.error(errorMsg);
       setVoiceState('idle');
       setIsListening(false);
+      setIsConnected(false);
     };
   }, [user?.id, handleWsMessage]);
 

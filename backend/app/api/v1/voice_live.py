@@ -11,7 +11,13 @@ import logging
 from typing import Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deps import require_websocket_auth
+from app.core.database import get_db
+from app.core.exceptions import ValidationError
+from app.models.dealership import Dealership
 from app.services.realtime_voice_service import get_realtime_voice_service
 
 logger = logging.getLogger(__name__)
@@ -211,6 +217,38 @@ async def voice_chat_live(websocket: WebSocket, user_id: int):
     - {"type": "error", "message": "..."}
     """
     await websocket.accept()
+    
+    # Authenticate user - this verifies JWT token and matches user_id
+    try:
+        current_user = await require_websocket_auth(websocket, user_id)
+    except Exception as e:
+        logger.warning(f"WebSocket auth failed for user {user_id}: {e}")
+        return
+    
+    # Get database session for dealership checks
+    try:
+        async with get_db() as db:
+            # Check if user has dealership access (especially important for super_admin)
+            if current_user.dealership_id:
+                result = await db.execute(
+                    select(Dealership).where(Dealership.id == current_user.dealership_id)
+                )
+                dealership = result.scalar_one_or_none()
+                if not dealership:
+                    await websocket.close(code=4003, reason="Dealership not found")
+                    logger.warning(f"User {current_user.id} dealership not found")
+                    return
+            else:
+                # User must have a dealership assigned
+                await websocket.close(code=4003, reason="User not assigned to a dealership")
+                logger.warning(f"User {current_user.id} has no dealership assigned")
+                return
+                
+    except Exception as e:
+        logger.error(f"Error validating dealership access: {e}")
+        await websocket.close(code=4000, reason="Authorization check failed")
+        return
+    
     session = LiveVoiceSession(websocket, user_id)
     logger.info(f"[LiveVoice] Session started for user {user_id}")
     
